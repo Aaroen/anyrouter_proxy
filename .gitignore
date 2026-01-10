@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.secrets
+**/.env
+**/.env.*
+!**/.env.example
+__pycache__/
+*.pyc
+logs/
+*.log
+.key_usage_stats.json
+cooldown_state.json
