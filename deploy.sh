@@ -305,8 +305,30 @@ SECRETS_URLS=""
 
 if [ -f "$SECRETS_FILE" ]; then
     echo -e "${GREEN}✓${NC} 检测到 .secrets 文件，读取敏感配置..."
-    # 使用 source 加载 .secrets
-    source "$SECRETS_FILE"
+    # 安全读取（仅支持 KEY=VALUE，不执行任何脚本）
+    load_secrets_kv() {
+        local file="$1"
+        local line key value
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in
+                ""|\#*) continue ;;
+            esac
+            case "$line" in
+                API_KEYS=*|CANDIDATE_URLS=*)
+                    key="${line%%=*}"
+                    value="${line#*=}"
+                    value="${value#[[:space:]]}"
+                    value="${value%[[:space:]]}"
+                    if [[ ( "$value" == \"*\" && "$value" == *\" ) || ( "$value" == \'*\' && "$value" == *\' ) ]]; then
+                        value="${value:1:${#value}-2}"
+                    fi
+                    export "$key=$value"
+                    ;;
+            esac
+        done < "$file"
+    }
+    load_secrets_kv "$SECRETS_FILE"
     SECRETS_API_KEYS="${API_KEYS:-}"
     SECRETS_URLS="${CANDIDATE_URLS:-}"
     if [ -n "$SECRETS_API_KEYS" ]; then
@@ -455,6 +477,16 @@ mkdir -p "$PROJECT_ROOT/tests"
 mkdir -p "$PROJECT_ROOT/deprecated"
 mkdir -p "$PROJECT_ROOT/logs"
 
+# headers 文件为可选配置：不存在则自动创建空 JSON
+HEADERS_FILE="$PROJECT_ROOT/env/.env.headers.json"
+if [ ! -f "$HEADERS_FILE" ]; then
+    cat > "$HEADERS_FILE" <<EOF
+{}
+EOF
+    chmod 600 "$HEADERS_FILE" 2>/dev/null || true
+    echo -e "${YELLOW}⚠${NC} 未找到 env/.env.headers.json，已自动创建空配置"
+fi
+
 echo -e "${GREEN}✓${NC} 目录结构完整"
 echo ""
 
@@ -487,7 +519,8 @@ echo -e "${CYAN}[6/6] 验证部署...${NC}"
 echo ""
 
 # 检查核心文件
-CORE_FILES=("app.py" "strict_wrapper.py" "env/.env.headers.json")
+CORE_FILES=("app.py" "strict_wrapper.py")
+OPTIONAL_FILES=("env/.env.headers.json")
 ALL_FILES_OK=true
 
 for file in "${CORE_FILES[@]}"; do
@@ -496,6 +529,14 @@ for file in "${CORE_FILES[@]}"; do
         ALL_FILES_OK=false
     else
         echo -e "${GREEN}✓${NC} 核心文件存在: $file"
+    fi
+done
+
+for file in "${OPTIONAL_FILES[@]}"; do
+    if [ ! -f "$PROJECT_ROOT/$file" ]; then
+        echo -e "${YELLOW}⚠${NC} 可选文件缺失（可忽略）: $file"
+    else
+        echo -e "${GREEN}✓${NC} 可选文件存在: $file"
     fi
 done
 
@@ -531,6 +572,14 @@ echo ""
 echo "日志文件位置:"
 echo "   $PROJECT_ROOT/logs/"
 echo ""
+
+if [ -z "${SECRETS_API_KEYS:-}" ] || [ -z "${SECRETS_URLS:-}" ]; then
+    echo -e "${YELLOW}⚠ 未检测到完整配置（API_KEYS/CANDIDATE_URLS）${NC}"
+    echo "  1) 编辑: $SECRETS_FILE"
+    echo "  2) 填写: API_KEYS=..., CANDIDATE_URLS=..."
+    echo "  3) 重新运行: $PROJECT_ROOT/deploy.sh"
+    echo ""
+fi
 
 if [ "$CLASH_DETECTED" = true ]; then
     echo -e "${CYAN}Clash 代理状态: 已启用${NC}"

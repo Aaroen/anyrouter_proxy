@@ -5,6 +5,7 @@
 **/.env
 **/.env.*
 !**/.env.example
+!env/.env.headers.json
 __pycache__/
 *.pyc
 logs/
