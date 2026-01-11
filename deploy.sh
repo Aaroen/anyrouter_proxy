@@ -433,7 +433,7 @@ DEBUG_MODE=false
 #
 # 4. 快速开始：
 #    # 创建并填写 .secrets（敏感信息）
-#    nano .secrets  # 填写 API_KEYS / CANDIDATE_URLS
+#    编辑 .secrets  # 填写 API_KEYS / CANDIDATE_URLS
 #    ./deploy.sh  # 执行部署
 #
 # 5. 验证配置：
@@ -557,7 +557,7 @@ echo "1. 激活配置:"
 echo "   source ~/.bashrc"
 echo ""
 echo "2. (可选) 编辑配置文件添加更多 API Keys:"
-echo "   nano $SECRETS_FILE"
+echo "   $SECRETS_FILE"
 echo ""
 echo "3. 启动 Claude Code:"
 echo "   claude"

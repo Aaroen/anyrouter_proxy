@@ -21,7 +21,7 @@ git clone https://github.com/Aaroen/anyrouter_proxy.git ~/anyrouter_proxy
 cp ~/anyrouter_proxy/.env.example ~/anyrouter_proxy/.env
 cp ~/anyrouter_proxy/.secrets.example ~/anyrouter_proxy/.secrets
 chmod 600 ~/anyrouter_proxy/.secrets ~/anyrouter_proxy/.env
-${EDITOR:-vi} ~/anyrouter_proxy/.secrets
+# 手动编辑 ~/anyrouter_proxy/.secrets，填入正确的 API_KEYS / CANDIDATE_URLS
 ~/anyrouter_proxy/deploy.sh
 ```
 
