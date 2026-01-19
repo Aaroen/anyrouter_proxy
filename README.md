@@ -7,6 +7,7 @@ Claude Code 透明代理工具，支持多上游容错、多 API Key 轮询。
 # 一键部署（已存在则自动更新后再部署）
 
 ```bash
+
 bash -lc 'set -e; dir="$HOME/anyrouter_proxy"; if [ -d "$dir/.git" ]; then git -C "$dir" pull --rebase; else git clone https://github.com/Aaroen/anyrouter_proxy.git "$dir"; fi; bash "$dir/deploy.sh"'
 
 ```
