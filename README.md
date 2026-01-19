@@ -5,8 +5,8 @@ Claude Code 透明代理工具，支持多上游容错、多 API Key 轮询。
 ## 快速使用
 
 ```bash
-# 一键部署（自动配置环境、检测代理、生成配置）
-~/anyrouter_proxy/deploy.sh
+# 一键部署（已存在则自动更新后再部署）
+bash -lc 'set -e; dir="$HOME/anyrouter_proxy"; if [ -d "$dir/.git" ]; then git -C "$dir" pull --rebase; else git clone https://github.com/Aaroen/anyrouter_proxy.git "$dir"; fi; bash "$dir/deploy.sh"'
 
 # 启动 Claude Code
 source ~/.bashrc
@@ -16,13 +16,16 @@ claude
 ## 从 GitHub 一键部署
 
 ```bash
+# 一行命令（已存在则自动 git pull 更新后再部署）
+bash -lc 'set -e; dir="$HOME/anyrouter_proxy"; if [ -d "$dir/.git" ]; then git -C "$dir" pull --rebase; else git clone https://github.com/Aaroen/anyrouter_proxy.git "$dir"; fi; bash "$dir/deploy.sh"'
+
+# 手动方式：
 git clone https://github.com/Aaroen/anyrouter_proxy.git ~/anyrouter_proxy
-# 建议把敏感信息放在 .secrets（不会被 Git 跟踪）
-cp ~/anyrouter_proxy/.env.example ~/anyrouter_proxy/.env
+# 建议把敏感信息放在 .secrets（不会被 Git 跟踪；deploy.sh 也会在缺失时自动生成示例）
 cp ~/anyrouter_proxy/.secrets.example ~/anyrouter_proxy/.secrets
-chmod 600 ~/anyrouter_proxy/.secrets ~/anyrouter_proxy/.env
+chmod 600 ~/anyrouter_proxy/.secrets
 # 手动编辑 ~/anyrouter_proxy/.secrets，填入正确的 API_KEYS / CANDIDATE_URLS
-~/anyrouter_proxy/deploy.sh
+bash ~/anyrouter_proxy/deploy.sh
 ```
 
 ## 参数说明
