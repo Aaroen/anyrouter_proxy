@@ -471,8 +471,20 @@ async def lifespan(_: FastAPI):
         raise
 
     # 预获取 WAF cookie (异步)
+    # 注意：不要阻塞 FastAPI/uvicorn 启动流程，否则会导致本地代理“偶发启动超时”
+    #（例如网络抖动/WAF 探测慢时）。改为后台任务，失败不影响服务监听端口。
     if 'anyrouter' in TARGET_BASE_URL or 'cspok' in TARGET_BASE_URL:
-        await fetch_waf_cookie(http_client, TARGET_BASE_URL, force=True)
+        async def _prefetch_waf_cookie():
+            try:
+                await asyncio.wait_for(
+                    fetch_waf_cookie(http_client, TARGET_BASE_URL, force=True),
+                    timeout=8
+                )
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"[WAF] 预获取 cookie 失败（不影响启动）: {e}")
+
+        asyncio.create_task(_prefetch_waf_cookie())
 
     print("=" * 60)
 

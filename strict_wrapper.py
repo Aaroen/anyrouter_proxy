@@ -3,6 +3,7 @@
 Claude Code Wrapper - 配置文件版
 支持从 .env 文件读取配置，提高可移植性和安全性
 """
+from __future__ import annotations
 import os
 import sys
 import subprocess
@@ -125,6 +126,13 @@ CLAUDE_BIN = os.getenv("CLAUDE_BIN", "/home/aroen/.npm-global/bin/claude")
 PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 UVICORN_BIN = os.getenv("UVICORN_BIN", "/home/aroen/miniconda3/bin/uvicorn")
 
+# 日志目录
+LOG_DIR = SCRIPT_DIR / "logs"
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
 # Clash 配置
 CLASH_API = os.getenv("CLASH_API", "http://127.0.0.1:9090")
 CLASH_PROXY_ADDR = os.getenv("CLASH_PROXY_ADDR", "http://127.0.0.1:7890")
@@ -172,14 +180,24 @@ if not CANDIDATE_URLS:
 
 # 全局进程引用，用于清理
 proxy_process = None
+proxy_log_fp = None
 
 def cleanup():
     """清理后台代理进程"""
+    global proxy_process
     if proxy_process:
         try:
             os.killpg(os.getpgid(proxy_process.pid), signal.SIGTERM)
         except:
             pass
+        proxy_process = None
+    global proxy_log_fp
+    if proxy_log_fp:
+        try:
+            proxy_log_fp.close()
+        except Exception:
+            pass
+        proxy_log_fp = None
 
 atexit.register(cleanup)
 
@@ -267,18 +285,46 @@ def get_next_key():
 def get_free_port():
     """获取一个随机空闲端口"""
     with socket.socket() as s:
-        s.bind(('', 0))
+        s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-def wait_for_port(port, timeout=5):
-    """等待端口 ready"""
+def _tail_file(path: Path, lines: int = 80) -> str:
+    try:
+        data = path.read_bytes()
+        text = data.decode("utf-8", errors="replace")
+        parts = text.splitlines()
+        return "\n".join(parts[-lines:])
+    except Exception:
+        return ""
+
+def wait_for_port(port: int, proc: subprocess.Popen | None = None, timeout: float = 20.0) -> bool:
+    """等待端口 ready；同时监测进程是否提前退出"""
     start_time = time.time()
     while time.time() - start_time < timeout:
+        if proc is not None and proc.poll() is not None:
+            return False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
             if s.connect_ex(('127.0.0.1', port)) == 0:
                 return True
         time.sleep(0.1)
     return False
+
+def _resolve_uvicorn_command() -> list[str]:
+    """
+    优先使用 UVICORN_BIN；如果不可用则回退到 python -m uvicorn，
+    避免“uvicorn 可执行文件不存在/权限不对/指向错误环境”导致启动失败。
+    """
+    if UVICORN_BIN and os.path.exists(UVICORN_BIN):
+        return [UVICORN_BIN]
+    try:
+        subprocess.run([PYTHON_BIN, "-c", "import uvicorn"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return [PYTHON_BIN, "-m", "uvicorn"]
+    except Exception:
+        uvicorn_in_path = subprocess.run(["which", "uvicorn"], capture_output=True, text=True).stdout.strip()
+        if uvicorn_in_path:
+            return [uvicorn_in_path]
+    return []
 
 def optimize_clash():
     """Clash 优选逻辑"""
@@ -570,6 +616,7 @@ def select_best_upstream():
 
 def main():
     global proxy_process
+    global proxy_log_fp
 
     # 1. 优化 Clash
     optimize_clash()
@@ -581,60 +628,79 @@ def main():
     # 更新候选URL列表字符串（排序后）
     sorted_urls_str = ",".join(sorted_urls)
 
-    proxy_port = get_free_port()
+    startup_timeout = float(os.getenv("PROXY_STARTUP_TIMEOUT", "20"))
 
-    # 准备给子进程 (Proxy) 的环境变量
-    proxy_env = os.environ.copy()
-    proxy_env["API_BASE_URL"] = best_url
-    proxy_env["CANDIDATE_URLS"] = sorted_urls_str  # 传递排序后的候选列表给 app.py
-    proxy_env["PORT"] = str(proxy_port)
-    proxy_env["HTTP_PROXY"] = CLASH_PROXY_ADDR
-    proxy_env["HTTPS_PROXY"] = CLASH_PROXY_ADDR
-    proxy_env["SYSTEM_PROMPT_REPLACEMENT"] = SYSTEM_PROMPT_REPLACEMENT
-    
-    # 如果需要禁用非必要流量（第二轮测试才成功），自动设置环境变量
-    if need_disable_nonessential:
-        proxy_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-        print(f"\033[33m[Wrapper] 已自动设置 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\033[0m")
+    uvicorn_prefix = _resolve_uvicorn_command()
+    if not uvicorn_prefix:
+        print("\033[31m[Error] 未找到 uvicorn，请检查 UVICORN_BIN/PYTHON_BIN 配置\033[0m")
+        sys.exit(1)
+
+    proxy_log_path = LOG_DIR / "proxy.log"
 
     # 3. 启动原版 app.py (通过 uvicorn)
-    print(f"\033[90m[Wrapper] 启动本地透明代理 (Port {proxy_port})...\033[0m")
+    # 增加重试：端口竞争/启动慢/偶发导入失败时可以给出明确日志并更换端口重试
+    last_error = None
+    for attempt in range(1, 4):
+        proxy_port = get_free_port()
 
-    # 优先使用配置的 uvicorn，否则尝试自动查找
-    uvicorn_cmd = UVICORN_BIN
-    if not os.path.exists(uvicorn_cmd):
-        # 尝试从 PATH 查找
-        uvicorn_in_path = subprocess.run(
-            ["which", "uvicorn"],
-            capture_output=True,
-            text=True
-        ).stdout.strip()
+        # 准备给子进程 (Proxy) 的环境变量
+        proxy_env = os.environ.copy()
+        proxy_env["API_BASE_URL"] = best_url
+        proxy_env["CANDIDATE_URLS"] = sorted_urls_str  # 传递排序后的候选列表给 app.py
+        proxy_env["PORT"] = str(proxy_port)
+        proxy_env["HTTP_PROXY"] = CLASH_PROXY_ADDR
+        proxy_env["HTTPS_PROXY"] = CLASH_PROXY_ADDR
+        proxy_env["SYSTEM_PROMPT_REPLACEMENT"] = SYSTEM_PROMPT_REPLACEMENT
 
-        if uvicorn_in_path:
-            uvicorn_cmd = uvicorn_in_path
-        else:
-            print("\033[31m[Error] 未找到 uvicorn，请检查 UVICORN_BIN 配置\033[0m")
-            sys.exit(1)
+        # 如果需要禁用非必要流量（第二轮测试才成功），自动设置环境变量
+        if need_disable_nonessential:
+            proxy_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+            print(f"\033[33m[Wrapper] 已自动设置 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\033[0m")
 
-    cmd = [
-        uvicorn_cmd,
-        "app:app",
-        "--host", "127.0.0.1",
-        "--port", str(proxy_port),
-        "--log-level", "error"  # 减少噪音
-    ]
+        cmd = uvicorn_prefix + [
+            "app:app",
+            "--host", "127.0.0.1",
+            "--port", str(proxy_port),
+            "--log-level", "error",
+        ]
 
-    proxy_process = subprocess.Popen(
-        cmd,
-        cwd=PROXY_DIR,
-        env=proxy_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid
-    )
+        print(f"\033[90m[Wrapper] 启动本地透明代理 (Port {proxy_port})... [Attempt {attempt}/3]\033[0m")
+        print(f"\033[90m[Wrapper] 代理日志: {proxy_log_path}\033[0m")
+        try:
+            proxy_log_fp = open(proxy_log_path, "ab", buffering=0)
+            proxy_log_fp.write(f"\n=== proxy start: {time.strftime('%Y-%m-%d %H:%M:%S')} (port={proxy_port}) ===\n".encode("utf-8"))
+        except Exception:
+            proxy_log_fp = None
 
-    if not wait_for_port(proxy_port):
-        print("\033[31m[Error] Failed to start local proxy server.\033[0m")
+        proxy_process = subprocess.Popen(
+            cmd,
+            cwd=PROXY_DIR,
+            env=proxy_env,
+            stdout=proxy_log_fp if proxy_log_fp else subprocess.DEVNULL,
+            stderr=proxy_log_fp if proxy_log_fp else subprocess.DEVNULL,
+            preexec_fn=os.setsid
+        )
+
+        if wait_for_port(proxy_port, proc=proxy_process, timeout=startup_timeout):
+            break
+
+        last_error = f"local proxy not ready within {startup_timeout}s"
+        # 如果进程已退出，输出尾部日志便于定位
+        if proxy_process.poll() is not None:
+            last_error = f"local proxy exited early (code={proxy_process.returncode})"
+        print(f"\033[31m[Error] {last_error}\033[0m")
+        if proxy_log_path.exists():
+            tail = _tail_file(proxy_log_path, lines=80)
+            if tail:
+                print("\033[90m[Proxy Log Tail]\033[0m")
+                print(tail)
+                print("\033[90m[End]\033[0m")
+
+        # 清理本次失败进程后重试
+        cleanup()
+
+    else:
+        print("\033[31m[Error] Failed to start local proxy server after retries.\033[0m")
         sys.exit(1)
 
     print("\033[32m[Wrapper] 代理就绪。启动 Claude Code...\033[0m")

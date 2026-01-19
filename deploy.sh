@@ -4,7 +4,8 @@
 # 功能：自动检测环境、Clash 代理、生成配置
 # ==========================================
 
-set -e  # 遇到错误立即退出
+set -Eeuo pipefail  # 遇到错误立即退出（并捕获管道错误）
+IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
@@ -16,6 +17,15 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+on_error() {
+    local exit_code=$?
+    local line_no=${1:-"?"}
+    echo ""
+    echo -e "${RED:-}[Error] 部署脚本执行失败 (exit=${exit_code}, line=${line_no})${NC:-}" >&2
+    exit "${exit_code}"
+}
+trap 'on_error $LINENO' ERR
 
 echo "========================================"
 echo "  AnyRouter Proxy 增强版部署脚本"
@@ -40,7 +50,11 @@ check_port() {
         netstat -tuln 2>/dev/null | grep -q ":$port "
     else
         # 使用 bash 内置功能
-        timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$port" 2>/dev/null
+        if command_exists timeout; then
+            timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$port" 2>/dev/null
+        else
+            bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$port" 2>/dev/null
+        fi
     fi
 }
 
@@ -78,6 +92,131 @@ find_executable() {
     return 1
 }
 
+# 检测包管理器
+detect_package_manager() {
+    if command_exists apt-get; then
+        echo "apt"
+    elif command_exists dnf; then
+        echo "dnf"
+    elif command_exists yum; then
+        echo "yum"
+    elif command_exists pacman; then
+        echo "pacman"
+    elif command_exists zypper; then
+        echo "zypper"
+    elif command_exists apk; then
+        echo "apk"
+    else
+        echo "unknown"
+    fi
+}
+
+# sudo 兼容：root 环境下不需要 sudo
+SUDO=""
+if [ "$(id -u)" -ne 0 ] && command_exists sudo; then
+    SUDO="sudo"
+fi
+
+install_system_deps() {
+    local pkg_manager="$1"
+    shift
+    local deps=("$@")
+
+    if [ "${#deps[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ]; then
+        echo -e "${YELLOW}⚠ 需要 root 权限安装系统依赖，但当前没有 sudo；将跳过系统依赖安装${NC}"
+        return 1
+    fi
+
+    case "$pkg_manager" in
+        apt)
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get update -qq > /dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y --no-install-recommends "${deps[@]}" > /dev/null 2>&1
+            ;;
+        dnf)
+            $SUDO dnf install -y "${deps[@]}" > /dev/null 2>&1
+            ;;
+        yum)
+            $SUDO yum install -y "${deps[@]}" > /dev/null 2>&1
+            ;;
+        pacman)
+            $SUDO pacman -S --noconfirm "${deps[@]}" > /dev/null 2>&1
+            ;;
+        zypper)
+            $SUDO zypper install -y "${deps[@]}" > /dev/null 2>&1
+            ;;
+        apk)
+            $SUDO apk add --no-cache "${deps[@]}" > /dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+http_get() {
+    local url="$1"
+    local timeout_s="${2:-2}"
+    if command_exists curl; then
+        curl -fsS -m "$timeout_s" "$url" 2>/dev/null || true
+    elif command_exists wget; then
+        wget -q -T "$timeout_s" -O - "$url" 2>/dev/null || true
+    else
+        return 1
+    fi
+}
+
+# 参数
+FORCE_ENV=0
+SKIP_ENV=0
+NO_ALIAS=0
+USE_SYSTEM_PYTHON=0
+VENV_DIR_DEFAULT="$PROJECT_ROOT/env/.venv"
+VENV_DIR="$VENV_DIR_DEFAULT"
+
+usage() {
+    echo "用法: $0 [选项]"
+    echo ""
+    echo "选项:"
+    echo "  --force-env, -f     覆盖已存在的 .env（默认不覆盖）"
+    echo "  --skip-env          跳过生成 .env"
+    echo "  --no-alias          不修改 shell rc（默认会写入 alias anyrouter=...）"
+    echo "  --system-python     不创建 venv，直接使用系统 Python（不推荐）"
+    echo "  --venv <path>       指定 venv 目录（默认: $VENV_DIR_DEFAULT）"
+    echo "  --help, -h          显示帮助"
+}
+
+while [ $# -gt 0 ]; do
+    case "${1:-}" in
+        --force-env|-f) FORCE_ENV=1 ;;
+        --skip-env) SKIP_ENV=1 ;;
+        --no-alias) NO_ALIAS=1 ;;
+        --system-python) USE_SYSTEM_PYTHON=1 ;;
+        --venv)
+            shift
+            VENV_DIR="${1:-}"
+            if [ -z "$VENV_DIR" ]; then
+                echo -e "${RED}✗ --venv 需要提供路径${NC}"
+                exit 1
+            fi
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}✗ 未知参数: ${1}${NC}"
+            echo ""
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
 # ==========================================
 # 步骤 1: 环境检查
 # ==========================================
@@ -85,41 +224,77 @@ echo -e "${CYAN}[1/6] 检查运行环境...${NC}"
 echo ""
 
 # 检查 Python
+PKG_MANAGER="$(detect_package_manager)"
+echo -e "${GREEN}✓${NC} 包管理器: ${PKG_MANAGER}"
+
+SYSTEM_DEPS=()
+if ! command_exists python3; then
+    SYSTEM_DEPS+=("python3")
+fi
+
+# Debian/Ubuntu 常见：venv/pip 需要单独安装
+if [ "$PKG_MANAGER" = "apt" ]; then
+    if [ "$USE_SYSTEM_PYTHON" -ne 1 ]; then
+        SYSTEM_DEPS+=("python3-venv")
+    fi
+    SYSTEM_DEPS+=("python3-pip")
+fi
+
+# Clash 探测/节点优选需要 curl/jq（缺少则降级）
+if ! command_exists curl && ! command_exists wget; then
+    SYSTEM_DEPS+=("curl")
+fi
+if ! command_exists jq; then
+    SYSTEM_DEPS+=("jq")
+fi
+
+if [ "${#SYSTEM_DEPS[@]}" -gt 0 ] && [ "$PKG_MANAGER" != "unknown" ]; then
+    echo -e "${YELLOW}⚠ 尝试安装系统依赖: ${SYSTEM_DEPS[*]}${NC}"
+    install_system_deps "$PKG_MANAGER" "${SYSTEM_DEPS[@]}" || true
+fi
+
 if ! command_exists python3; then
     echo -e "${RED}✗ 错误：未找到 python3${NC}"
     exit 1
 fi
-PYTHON_PATH=$(find_executable python3)
-PYTHON_VERSION=$(python3 --version 2>&1)
-echo -e "${GREEN}✓${NC} Python3: $PYTHON_VERSION"
-echo -e "  路径: $PYTHON_PATH"
 
-# 检查 Python 依赖
-echo ""
-echo "检查 Python 依赖包..."
-REQUIRED_PACKAGES="fastapi uvicorn httpx python-dotenv requests"
-MISSING_PACKAGES=""
+PYTHON_SYS_PATH="$(find_executable python3)"
+echo -e "${GREEN}✓${NC} Python3: $(python3 --version 2>&1)"
+echo -e "  系统路径: $PYTHON_SYS_PATH"
 
-for pkg in $REQUIRED_PACKAGES; do
-    if ! python3 -c "import ${pkg//-/_}" 2>/dev/null; then
-        MISSING_PACKAGES="$MISSING_PACKAGES $pkg"
+mkdir -p "$PROJECT_ROOT/env"
+
+if [ "$USE_SYSTEM_PYTHON" -ne 1 ]; then
+    echo ""
+    echo "正在准备 Python venv..."
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
+            if [ "$PKG_MANAGER" = "apt" ]; then
+                echo -e "${YELLOW}⚠ venv 创建失败，尝试安装 python3-venv...${NC}"
+                install_system_deps "$PKG_MANAGER" python3-venv || true
+            fi
+            python3 -m venv "$VENV_DIR"
+        fi
     fi
-done
 
-if [ -n "$MISSING_PACKAGES" ]; then
-    echo -e "${YELLOW}⚠ 缺少依赖包:$MISSING_PACKAGES${NC}"
-    echo "自动安装中..."
-    # 尝试多种安装方式
-    if command_exists pip3; then
-        pip3 install $MISSING_PACKAGES
-    elif command_exists pip; then
-        pip install $MISSING_PACKAGES
-    else
-        python3 -m pip install $MISSING_PACKAGES
-    fi
-    echo -e "${GREEN}✓${NC} 依赖包安装完成"
+    PYTHON_PATH="$VENV_DIR/bin/python"
+    PIP_PATH="$VENV_DIR/bin/pip"
+    UVICORN_PATH="$VENV_DIR/bin/uvicorn"
+
+    echo -e "${GREEN}✓${NC} venv: $VENV_DIR"
+    echo "安装/更新 Python 依赖（requirements.txt）..."
+    "$PIP_PATH" -q install -U pip setuptools wheel
+    "$PIP_PATH" -q install -r "$PROJECT_ROOT/requirements.txt"
+
+    # 快速导入测试
+    "$PYTHON_PATH" -c "import fastapi,uvicorn,httpx,dotenv,requests" 2>/dev/null
+    echo -e "${GREEN}✓${NC} Python 依赖安装完成"
 else
-    echo -e "${GREEN}✓${NC} 所有依赖包已安装"
+    PYTHON_PATH="$PYTHON_SYS_PATH"
+    UVICORN_PATH="$(find_executable uvicorn 2>/dev/null || echo "")"
+    if [ -z "$UVICORN_PATH" ]; then
+        echo -e "${YELLOW}⚠ 未找到 uvicorn（建议不使用 --system-python，改用 venv）${NC}"
+    fi
 fi
 
 # 检查 Claude CLI
@@ -134,15 +309,14 @@ else
     CLAUDE_PATH="/home/$(whoami)/.npm-global/bin/claude"
 fi
 
-# 检查 Uvicorn
 echo ""
-UVICORN_PATH=""
-if command_exists uvicorn; then
-    UVICORN_PATH=$(find_executable uvicorn)
+if [ -n "${UVICORN_PATH:-}" ] && [ -x "${UVICORN_PATH:-}" ]; then
     echo -e "${GREEN}✓${NC} Uvicorn: $UVICORN_PATH"
 else
-    echo -e "${YELLOW}⚠ 未找到 uvicorn${NC}"
-    UVICORN_PATH="$HOME/miniconda3/bin/uvicorn"
+    echo -e "${YELLOW}⚠ 未找到可用的 uvicorn 可执行文件${NC}"
+    if [ "$USE_SYSTEM_PYTHON" -ne 1 ]; then
+        echo -e "${YELLOW}提示：请确认 venv 已正确创建并安装依赖（$VENV_DIR）${NC}"
+    fi
 fi
 
 echo ""
@@ -166,14 +340,12 @@ COMMON_CLASH_PORTS=(9090 9091 7890 9097)
 for port in "${COMMON_CLASH_PORTS[@]}"; do
     if check_port $port; then
         # 尝试访问 Clash API
-        if command_exists curl; then
-            response=$(curl -s -m 1 "http://127.0.0.1:$port/proxies" 2>/dev/null || echo "")
-            if echo "$response" | grep -q "proxies"; then
-                CLASH_API_URL="http://127.0.0.1:$port"
-                echo -e "${GREEN}✓${NC} 检测到 Clash API: $CLASH_API_URL"
-                CLASH_DETECTED=true
-                break
-            fi
+        response="$(http_get "http://127.0.0.1:$port/proxies" 1 || true)"
+        if echo "$response" | grep -q "proxies"; then
+            CLASH_API_URL="http://127.0.0.1:$port"
+            echo -e "${GREEN}✓${NC} 检测到 Clash API: $CLASH_API_URL"
+            CLASH_DETECTED=true
+            break
         fi
     fi
 done
@@ -195,7 +367,8 @@ if [ "$CLASH_DETECTED" = true ]; then
 
     if command_exists curl && command_exists jq; then
         # 获取所有代理节点
-        proxies_json=$(curl -s "$CLASH_API_URL/proxies" 2>/dev/null || echo "{}")
+        proxies_json="$(http_get "$CLASH_API_URL/proxies" 2)"
+        proxies_json="${proxies_json:-{}}"
 
         # 查找选择器（通常是 Proxy、GLOBAL 或 节点选择）
         selector=""
@@ -341,19 +514,33 @@ if [ -f "$SECRETS_FILE" ]; then
     fi
 else
     echo -e "${YELLOW}⚠ 未找到 .secrets 文件${NC}"
-    echo "  请创建 $SECRETS_FILE 并填写 API_KEYS 和 CANDIDATE_URLS"
-    echo "  示例:"
-    echo "    CANDIDATE_URLS=https://anyrouter.top,https://other.api.com"
-    echo "    API_KEYS=sk-xxx,sk-yyy"
+    echo "  将自动创建示例文件（请手动填写 API_KEYS / CANDIDATE_URLS）"
+    if [ -f "$PROJECT_ROOT/.secrets.example" ]; then
+        cp "$PROJECT_ROOT/.secrets.example" "$SECRETS_FILE"
+    else
+        cat > "$SECRETS_FILE" <<EOF
+# 仅用于本机部署，请勿提交到 Git
+CANDIDATE_URLS=https://anyrouter.top
+API_KEYS=
+EOF
+    fi
+    chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+    echo "  已创建: $SECRETS_FILE"
     # 使用默认值（仅 URLs，不包含 Keys）
     SECRETS_URLS="https://anyrouter.top"
     SECRETS_API_KEYS=""
 fi
 
-if [ -f "$ENV_FILE" ]; then
-    echo -e "${YELLOW}⚠ .env 文件已存在，自动覆盖...${NC}"
-fi
 SKIP_CONFIG_GENERATION=false
+if [ "$SKIP_ENV" -eq 1 ]; then
+    SKIP_CONFIG_GENERATION=true
+    echo -e "${YELLOW}⚠ 已指定 --skip-env：跳过生成 .env${NC}"
+elif [ -f "$ENV_FILE" ] && [ "$FORCE_ENV" -ne 1 ]; then
+    SKIP_CONFIG_GENERATION=true
+    echo -e "${YELLOW}⚠ .env 已存在，将保留原文件（如需覆盖请使用 --force-env）${NC}"
+elif [ -f "$ENV_FILE" ] && [ "$FORCE_ENV" -eq 1 ]; then
+    echo -e "${YELLOW}⚠ 将覆盖已存在的 .env（--force-env）${NC}"
+fi
 
 if [ "$SKIP_CONFIG_GENERATION" = false ]; then
     echo "正在生成配置文件..."
@@ -496,19 +683,37 @@ echo ""
 echo -e "${CYAN}[5/6] 配置 anyrouter 命令别名...${NC}"
 echo ""
 
-BASHRC="$HOME/.bashrc"
-ALIAS_LINE="alias anyrouter=\"${PYTHON_BIN:-python3} $PROJECT_ROOT/strict_wrapper.py\""
+if [ "$NO_ALIAS" -eq 1 ]; then
+    echo -e "${YELLOW}⚠ 已指定 --no-alias：跳过写入 shell rc${NC}"
+else
+    SHELL_RC="$HOME/.bashrc"
+    if [ -n "${SHELL:-}" ] && echo "$SHELL" | grep -qi "zsh"; then
+        SHELL_RC="$HOME/.zshrc"
+    fi
+    touch "$SHELL_RC" 2>/dev/null || true
 
-# 检查是否已存在 alias
-if grep -q "alias anyrouter=" "$BASHRC" 2>/dev/null; then
-    echo "移除旧的 anyrouter alias..."
-    sed -i.bak '/alias anyrouter=/d' "$BASHRC"
+    # 优先使用本次部署计算得到的 PYTHON_PATH（venv），避免 .env 已存在时指向系统 Python
+    ALIAS_PY="${PYTHON_PATH:-${PYTHON_BIN:-python3}}"
+    ALIAS_LINE="alias anyrouter=\"${ALIAS_PY} $PROJECT_ROOT/strict_wrapper.py\""
+
+    ALIAS_BEGIN="# >>> anyrouter_proxy (managed) >>>"
+    ALIAS_END="# <<< anyrouter_proxy (managed) <<<"
+
+    # 清理旧配置块
+    if grep -q "$ALIAS_BEGIN" "$SHELL_RC" 2>/dev/null; then
+        sed -i.bak "/$ALIAS_BEGIN/,/$ALIAS_END/d" "$SHELL_RC" 2>/dev/null || true
+    fi
+
+    {
+        echo ""
+        echo "$ALIAS_BEGIN"
+        echo "$ALIAS_LINE"
+        echo "$ALIAS_END"
+    } >> "$SHELL_RC"
+
+    echo -e "${GREEN}✓${NC} 已添加 anyrouter 别名到 $SHELL_RC"
+    echo "  执行 'source $SHELL_RC' 或重启终端使其生效"
 fi
-
-# 添加新的 alias
-echo "$ALIAS_LINE" >> "$BASHRC"
-echo -e "${GREEN}✓${NC} 已添加 anyrouter 别名到 $BASHRC"
-echo "  执行 'source ~/.bashrc' 或重启终端使其生效"
 
 echo ""
 
@@ -554,7 +759,7 @@ echo ""
 echo "下一步操作:"
 echo ""
 echo "1. 激活配置:"
-echo "   source ~/.bashrc"
+echo "   source ~/.bashrc  # 或 source ~/.zshrc"
 echo ""
 echo "2. (可选) 编辑配置文件添加更多 API Keys:"
 echo "   $SECRETS_FILE"
