@@ -305,8 +305,18 @@ if command_exists claude; then
     echo -e "${GREEN}✓${NC} Claude CLI: $CLAUDE_PATH"
 else
     echo -e "${YELLOW}⚠ 未找到 claude 命令${NC}"
-    echo "  将在配置文件中使用默认路径"
-    CLAUDE_PATH="/home/$(whoami)/.npm-global/bin/claude"
+    # 尝试常见安装位置
+    for path in "$HOME/.local/bin/claude" "$HOME/.npm-global/bin/claude" "/usr/local/bin/claude"; do
+        if [ -x "$path" ]; then
+            CLAUDE_PATH="$path"
+            echo -e "${GREEN}✓${NC} 在 $path 找到 Claude CLI"
+            break
+        fi
+    done
+    if [ -z "$CLAUDE_PATH" ]; then
+        echo "  将在配置文件中使用默认路径"
+        CLAUDE_PATH="$HOME/.local/bin/claude"
+    fi
 fi
 
 echo ""
